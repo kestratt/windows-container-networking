@@ -31,6 +31,41 @@ Sample CNI Args:
     ]
 }
 
+Sample V6 CNI Args:
+{
+    "Name": "azure-cni",
+    "Type": "sdnbridge",
+    "Subnet": "192.168.0.0/24",
+    "SubnetV6": "192::0/24",
+    "Gateway": "192.168.0.2",
+    "GatewayV6": "192::2",
+    "InfraPrefix": "10.0.0.0/24",
+    "InfraPrefixV6": "10::0/24",
+    "DnsServers": ["168.63.129.16"],
+    "CustomAcls": "true",
+    "AdditionalPolicies": [{
+            "Type": "ACL",
+            "Settings": {
+                "RemoteAddresses": "192.168.0.0/24",
+                "Action": "Allow",
+                "Direction": "Out",
+                "Priority": 3004
+            }
+        },
+        {
+            "Type": "ACL",
+            "Settings": {
+                "RemoteAddresses": "10.0.0.0/24",
+                "Action": "Allow",
+                "Direction": "Out",
+                "Priority": 3005
+            }
+        }
+    ]
+}
+
+Note that the V6 CNI Args don't need the V6 Gateway since the network is created outside of the CNI
+
 Validate the json using JSON Lint (https://jsonlint.com/)
 
 Encode the JSON string with ASCII as the destination character set (https://www.base64encode.org/)
@@ -53,6 +88,8 @@ param (
 set-variable -name DEFAULT_CNI_VERSION -value ([string]"0.2.0") -Scope Script
 set-variable -name ACL_POLICY -value ([string]"ACL") -Scope Script
 set-variable -name DEFAULT_PRIORITY -value ([string]"-1") -Scope Script # Used to help in sorting the policies based on priority even if priority is not specified by user
+
+#todoken change these values? the throw message says 100-4096
 set-variable -name USER_POLICY_PRIO_START -value ([int]3000) -Scope Script
 set-variable -name USER_POLICY_PRIO_END -value ([int]8000) -Scope Script
 set-variable -name DHCP_CHECK_TIMEOUT_MIN -value ([int]60) -Scope Script
@@ -93,9 +130,12 @@ class CniArgs {
     [string] $Type
     [string] $Version
     [string] $Subnet
+    [string] $SubnetV6
     [string] $Gateway
     [string] $InfraPrefix
+    [string] $InfraPrefixV6
     [string] $ManagementIp
+    [string] $ManagementIpV6
     [string[]] $DnsServers
     [Policy[]] $AdditionalPolicies
     [bool] $SkipDefaultPolicies # Undocumented parameter to disable system policies
@@ -110,6 +150,10 @@ class CniArgs {
         $this.ManagementIp = $cniArgs.ManagementIp
         $this.InfraPrefix = $cniArgs.InfraPrefix
         $this.DnsServers = $cniArgs.DnsServers
+
+        $this.SubnetV6 = $cniArgs.SubnetV6
+        $this.ManagementIpV6 = $cniArgs.ManagementIpV6
+        $this.InfraPrefixV6 = $cniArgs.InfraPrefixV6
 
         # Optional Parameters
         if ($cniArgs.psobject.Properties.name.Contains('Version')) {$this.Version = $cniArgs.Version} else {$this.Version = $script:DEFAULT_CNI_VERSION}
@@ -150,13 +194,14 @@ class CniArgs {
                 #    | Non-negotiable | User-defined |    Negotiable   |
                 #    |----------------|--------------|-----------------|
                 #
-
+                Write-Host $cniArgs.AdditionalPolicies[$i]
                 if($cniArgs.AdditionalPolicies[$i].Type -eq $script:ACL_POLICY) {
                     $userPolicySetting = $cniArgs.AdditionalPolicies[$i].Settings
+                    Write-Host $userPolicySetting
                     # Ensure user-defined policy priorities are between 100-4096
                     if(-not (($userPolicySetting.Priority -ge $script:USER_POLICY_PRIO_START) -and ($userPolicySetting.Priority -le $script:USER_POLICY_PRIO_END))) {
                         Write-Verbose -Message ("User-defined ACL policies should have priority between {0} - {1}. Invalid policy: {2}" -f $script:USER_POLICY_PRIO_START, $script:USER_POLICY_PRIO_END, $userPolicySetting)
-                        throw "User-defined ACL policies should have priority between 100 - 4096. Invalid policy: $userPolicySetting"
+                        throw "User-defined ACL policies should have priority between 3000 - 8000. Invalid policy: $userPolicySetting"
                     }
                 }
 
@@ -263,6 +308,10 @@ class CniConf {
         $optionalFlags = [System.Collections.Specialized.OrderedDictionary]::new()
         $optionalFlags.Add('localRoutedPortMapping', $true)
         $optionalFlags.Add('allowAclPortMapping', $true)
+        if ($this.CheckDualStackParametersPresent($Args))
+        {
+            $optionalFlags.Add('enableDualStack', $true)
+        }
         $this.CniBase.Add('optionalFlags', $optionalFlags)
 
         if (-not $this.Args.SkipDefaultPolicies) {
@@ -281,6 +330,12 @@ class CniConf {
         $defaultPolicies = @()
         # Default PolicyList
         <#1#>$defaultPolicies += [Policy](@{Type='OutBoundNAT';Settings=@{Exceptions=@($this.Args.Subnet, ('{0}/32' -f $this.Args.ManagementIp))}} | ConvertTo-Json | ConvertFrom-Json)
+
+        if($this.CheckDualStackParametersPresent($Args))
+        {
+            $defaultPolicies += [Policy](@{Type='OutBoundNAT';Settings=@{Exceptions=@($this.Args.SubnetV6, ('{0}/32' -f $this.Args.ManagementIpV6))}} | ConvertTo-Json | ConvertFrom-Json)
+        }
+
         <#2#>$defaultPolicies += [Policy](@{Type='ACL';Settings=@{RemoteAddresses=$this.Args.InfraPrefix;Action='Block';Direction='Out';Priority=9001}} | ConvertTo-Json | ConvertFrom-Json)
         <#3#>$defaultPolicies += [Policy](@{Type='ACL';Settings=@{RemoteAddresses=$this.Args.Subnet;Action='Block';Direction='Out';Priority=9002}} | ConvertTo-Json | ConvertFrom-Json)
         <#4#>$defaultPolicies += [Policy](@{Type='ACL';Settings=@{Action='Allow';Direction='Out';Priority=9003}} | ConvertTo-Json | ConvertFrom-Json)
@@ -329,6 +384,12 @@ class CniConf {
     [String]Get() {
         $cniConfString = ConvertTo-Json -Depth 50 $this.CniBase
         return $cniConfString
+    }
+
+    [bool]CheckDualStackParametersPresent([System.Object] $cniArgs) {
+        return -not (($this.Args.SubnetV6 -eq "") -or
+        ($this.Args.ManagementIpV6 -eq "") -or
+        ($this.Args.InfraPrefixV6 -eq ""))
     }
 }
 
