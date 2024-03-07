@@ -22,7 +22,7 @@ func CreateBridgeTestNetwork() *hcn.HostComputeNetwork {
 
 func TestBridgeCmdAdd(t *testing.T) {
 	// t.Skip("Bridge test is disabled for now.")
-	testDualStack = (os.Getenv("TestDualStack") == "1")
+	testDualStack = (os.Getenv("TestDualStackL2B") == "1")
 	imageToUse = os.Getenv("ImageToUse")
 	testNetwork := CreateBridgeTestNetwork()
 	pt := util.MakeTestStruct(t, testNetwork, "L2Bridge", true, true, "", testDualStack, imageToUse)
